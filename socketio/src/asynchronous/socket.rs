@@ -10,26 +10,30 @@ use futures_util::{Stream, StreamExt};
 use rust_engineio::{
     asynchronous::Client as EngineClient, Packet as EnginePacket, PacketId as EnginePacketId,
 };
-use std::{
-    fmt::Debug,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::{fmt::Debug, pin::Pin, sync::Arc};
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub(crate) struct Socket {
     engine_client: Arc<EngineClient>,
-    connected: Arc<AtomicBool>,
+    // Guarded by a lock (not a bare `AtomicBool`) so that `send()` can check this flag and
+    // hand the packet to the engine.io layer as a single critical section. Previously this
+    // was a plain atomic: `send()` would check it, then (after an `.await` on
+    // `engine_client.emit()`) actually send — and `handle_socketio_packet()`'s
+    // Disconnect/ConnectError handling, or `disconnect()`, could flip it to `false` in
+    // between with no synchronization at all, spuriously failing an otherwise-healthy send
+    // with `IllegalActionBeforeOpen`. This mirrors the same fix applied at the engine.io
+    // layer (`rust_engineio::asynchronous::Socket::emit`/`handle_close`), which guards a
+    // separate, independent `connected` flag one layer down — this crate keeps its own on
+    // top of it, so both needed the same fix.
+    connected: Arc<Mutex<bool>>,
     generator: StreamGenerator<Packet>,
 }
 
 impl Socket {
     /// Creates an instance of `Socket`.
     pub(super) fn new(engine_client: EngineClient) -> Result<Self> {
-        let connected = Arc::new(AtomicBool::default());
+        let connected = Arc::new(Mutex::new(false));
         Ok(Socket {
             engine_client: Arc::new(engine_client.clone()),
             connected: connected.clone(),
@@ -44,7 +48,7 @@ impl Socket {
 
         // store the connected value as true, if the connection process fails
         // later, the value will be updated
-        self.connected.store(true, Ordering::Release);
+        *self.connected.lock().await = true;
 
         Ok(())
     }
@@ -55,15 +59,17 @@ impl Socket {
         if self.is_engineio_connected() {
             self.engine_client.disconnect().await?;
         }
-        if self.connected.load(Ordering::Acquire) {
-            self.connected.store(false, Ordering::Release);
-        }
+        *self.connected.lock().await = false;
         Ok(())
     }
 
     /// Sends a `socket.io` packet to the server using the `engine.io` client.
     pub async fn send(&self, packet: Packet) -> Result<()> {
-        if !self.is_engineio_connected() || !self.connected.load(Ordering::Acquire) {
+        // Hold the lock across "check connected" + "hand off to the engine.io layer" for
+        // the whole send (including attachments) — see the comment on the `connected`
+        // field for why a bare atomic check here was unsound.
+        let connected = self.connected.lock().await;
+        if !self.is_engineio_connected() || !*connected {
             return Err(Error::IllegalActionBeforeOpen());
         }
 
@@ -91,7 +97,7 @@ impl Socket {
 
     fn stream(
         client: EngineClient,
-        is_connected: Arc<AtomicBool>,
+        is_connected: Arc<Mutex<bool>>,
     ) -> Pin<Box<impl Stream<Item = Result<Packet>> + Send>> {
         Box::pin(try_stream! {
                 for await received_data in client.clone() {
@@ -101,7 +107,7 @@ impl Socket {
                         || packet.packet_id == EnginePacketId::MessageBinary
                     {
                         let packet = Self::handle_engineio_packet(packet, client.clone()).await?;
-                        Self::handle_socketio_packet(&packet, is_connected.clone());
+                        Self::handle_socketio_packet(&packet, is_connected.clone()).await;
 
                         yield packet;
                     }
@@ -111,16 +117,16 @@ impl Socket {
 
     /// Handles the connection/disconnection.
     #[inline]
-    fn handle_socketio_packet(socket_packet: &Packet, is_connected: Arc<AtomicBool>) {
+    async fn handle_socketio_packet(socket_packet: &Packet, is_connected: Arc<Mutex<bool>>) {
         match socket_packet.packet_type {
             PacketId::Connect => {
-                is_connected.store(true, Ordering::Release);
+                *is_connected.lock().await = true;
             }
             PacketId::ConnectError => {
-                is_connected.store(false, Ordering::Release);
+                *is_connected.lock().await = false;
             }
             PacketId::Disconnect => {
-                is_connected.store(false, Ordering::Release);
+                *is_connected.lock().await = false;
             }
             _ => (),
         }

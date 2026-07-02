@@ -495,16 +495,20 @@ impl Client {
         };
 
         // a socketio message always comes in one of the following two flavors (both JSON):
-        // 1: `["event", "msg", ...]`
-        // 2: `["msg"]`
-        // in case 2, the message is ment for the default message event, in case 1 the event
-        // is specified
+        // 1: `["event", "msg", ...]`   (named event — including zero-arg emits, `["event"]`)
+        // 2: `["msg"]`                 (default `message` event, `msg` isn't a string)
+        //
+        // Naming a zero-arg emit and a plain default-message send both produce a
+        // single-element array, so array length alone can't tell them apart. The only
+        // reliable signal is whether the first element is a string (an event name) — a
+        // previous version of this match special-cased `contents.len() == 1` as *always*
+        // the default `message` event, which silently swallowed every zero-arg named
+        // `.emit("some_event")` (server-side counterpart: `socket.emit("some_event")`
+        // with no second argument encodes to exactly `["some_event"]`), since no callback
+        // registered via `.on("some_event", ...)` would ever be dispatched to.
         if let Ok(Value::Array(contents)) = serde_json::from_str::<Value>(data) {
             let (event, payloads) = match contents.len() {
                 0 => return Err(Error::IncompletePacket()),
-                // Incorrect packet, ignore it
-                1 => (Event::Message, contents.as_slice()),
-                // it's a message event
                 _ => match contents.first() {
                     Some(Value::String(ev)) => (Event::from(ev.as_str()), &contents[1..]),
                     // get rest(1..) of them as data, not just take the 2nd element
@@ -948,8 +952,17 @@ mod test {
             .connect()
             .await?;
 
+        // The server does `client.emit('Hello from the message event!')` with no
+        // additional argument, i.e. the wire packet is the single-element array
+        // `["Hello from the message event!"]`. Per the Socket.IO protocol, an EVENT
+        // packet's first array element is always the event name regardless of how many
+        // further elements follow (including zero) — `.send(x)` is what produces the
+        // literal `"message"` event name, via `.emit('message', x)`, which always yields
+        // *two* elements. So this zero-arg `.emit(name)` call must be dispatched as a
+        // custom event literally named after its own text, not folded into a generic
+        // `"message"` event (see the fix to `handle_event`'s array-length matching above).
         let event = rx.recv().await.unwrap();
-        assert_eq!(event, "message");
+        assert_eq!(event, "Hello from the message event!");
 
         let event = rx.recv().await.unwrap();
         assert_eq!(event, "test");

@@ -97,7 +97,7 @@ impl Socket {
                 self.handle_data(packet.data.clone());
             }
             PacketId::Close => {
-                self.handle_close();
+                self.handle_close().await;
             }
             PacketId::Upgrade => {
                 // this is already checked during the handshake, so just do nothing here
@@ -149,9 +149,18 @@ impl Socket {
             self.handle.spawn(async move { on_close(()).await });
         }
 
-        self.emit(Packet::new(PacketId::Close, Bytes::new()))
-            .await?;
-
+        // Hold the transport lock across "send Close" + "flip connected to false" as a
+        // single critical section. `emit()` below takes this same lock before checking
+        // `connected`, so a concurrently in-flight `emit()` (e.g. the crate's own
+        // automatic Pong reply) can never be caught between "checked connected == true"
+        // and "actually sent the packet" while this function flips the flag out from
+        // under it — it either runs fully before or fully after this block.
+        let lock = self.transport.lock().await;
+        let close_packet: Bytes = Packet::new(PacketId::Close, Bytes::new()).into();
+        if let Err(error) = lock.as_transport().emit(close_packet, false).await {
+            self.call_error_callback(error.to_string());
+            return Err(error);
+        }
         self.connected.store(false, Ordering::Release);
 
         Ok(())
@@ -159,6 +168,18 @@ impl Socket {
 
     /// Sends a packet to the server.
     pub async fn emit(&self, packet: Packet) -> Result<()> {
+        // Check `connected` *while holding the transport lock*, not before acquiring it.
+        // Previously this check was a bare `AtomicBool::load` performed before the
+        // `self.transport.lock().await` below, leaving a check-then-act (TOCTOU) window:
+        // `disconnect()`/`handle_close()` could flip `connected` to false in between,
+        // after this call had already decided the socket was open, spuriously succeeding
+        // a send on an about-to-close socket — or, more commonly observed, racing this
+        // check against `handle_close()` and surfacing as a bogus `IllegalActionBeforeOpen`
+        // on a connection that was in fact healthy moments before. Acquiring the lock
+        // first makes the check and the send atomic with respect to `disconnect()`/
+        // `handle_close()`, which now take the same lock before touching `connected`.
+        let lock = self.transport.lock().await;
+
         if !self.connected.load(Ordering::Acquire) {
             let error = Error::IllegalActionBeforeOpen();
             self.call_error_callback(format!("{}", error));
@@ -175,7 +196,6 @@ impl Socket {
             packet.into()
         };
 
-        let lock = self.transport.lock().await;
         let fut = lock.as_transport().emit(data, is_binary);
 
         if let Err(error) = fut.await {
@@ -235,12 +255,19 @@ impl Socket {
         }
     }
 
-    pub(crate) fn handle_close(&self) {
+    pub(crate) async fn handle_close(&self) {
         if let Some(on_close) = self.on_close.as_ref() {
             let on_close = on_close.clone();
             self.handle.spawn(async move { on_close(()).await });
         }
 
+        // Take the same transport lock `emit()`/`disconnect()` hold around their
+        // connected-check + send. This guarantees a concurrently in-flight `emit()`
+        // either fully completes before we flip the flag, or observes `connected ==
+        // false` cleanly before it starts sending — never somewhere in between, which
+        // is what previously produced a spurious `IllegalActionBeforeOpen` on an
+        // otherwise-healthy connection.
+        let _lock = self.transport.lock().await;
         self.connected.store(false, Ordering::Release);
     }
 
